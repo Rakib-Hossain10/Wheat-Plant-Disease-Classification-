@@ -1,11 +1,14 @@
 import json
+import os
+import inspect
+from datetime import datetime
+from typing import Dict, Tuple, List
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import tensorflow as tf
-from PIL import Image
-from datetime import datetime
-import inspect
+from PIL import Image, ImageOps
 
 
 # ---------------------------------------
@@ -135,13 +138,20 @@ p, li, span { color: rgba(226,232,240,0.92); }
 
 
 # ---------------------------------------
-# Utility: width compatibility (Streamlit deprecation)
+# Robust paths (Streamlit Cloud safe)
+# ---------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+# ---------------------------------------
+# Compatibility helpers
 # ---------------------------------------
 def button_stretch(label, key=None):
     sig = inspect.signature(st.button)
     if "width" in sig.parameters:
         return st.button(label, key=key, width="stretch")
     return st.button(label, key=key, use_container_width=True)
+
 
 def download_stretch(label, data, file_name, mime, key=None):
     sig = inspect.signature(st.download_button)
@@ -150,13 +160,21 @@ def download_stretch(label, data, file_name, mime, key=None):
     return st.download_button(label, data=data, file_name=file_name, mime=mime, key=key, use_container_width=True)
 
 
+def st_image_auto(img, caption=None):
+    params = inspect.signature(st.image).parameters
+    if "use_container_width" in params:
+        st.image(img, caption=caption, use_container_width=True)
+    else:
+        st.image(img, caption=caption, use_column_width=True)
+
+
 # ---------------------------------------
 # Load model + metadata
 # ---------------------------------------
-@st.cache_resource
+@st.cache_resource(show_spinner=True)
 def load_assets(model_path: str, meta_path: str):
     model = tf.keras.models.load_model(model_path, compile=False)
-    with open(meta_path, "r") as f:
+    with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
     class_names = meta["class_names"]
@@ -166,20 +184,21 @@ def load_assets(model_path: str, meta_path: str):
 
 
 # ---------------------------------------
-# Preprocess: your model includes preprocessing (Sequential + Lambda)
+# Preprocess
+# NOTE: Your model includes preprocessing layers.
 # Keep pixels in 0..255 and only resize.
 # ---------------------------------------
 def preprocess_image(pil_img: Image.Image, image_size: int) -> np.ndarray:
     pil_img = pil_img.convert("RGB")
-    pil_img = pil_img.resize((image_size, image_size))
+    pil_img = ImageOps.fit(pil_img, (image_size, image_size), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
     x = np.array(pil_img).astype(np.float32)  # keep 0..255
-    x = np.expand_dims(x, axis=0)
-    return x
+    return np.expand_dims(x, axis=0)
 
 
-def predict_topk(model, x: np.ndarray, class_names, top_k: int = 3):
+def predict_topk(model, x: np.ndarray, class_names: List[str], top_k: int = 3):
     probs = model.predict(x, verbose=0)[0]
     probs = np.array(probs, dtype=np.float32)
+
     idx = probs.argsort()[::-1][:top_k]
     top = [(class_names[i], float(probs[i])) for i in idx]
     pred_name, pred_prob = top[0]
@@ -209,25 +228,26 @@ st.sidebar.markdown("## Wheat Disease Detection")
 st.sidebar.markdown("<div class='small'>ResNet50 • 8 classes</div>", unsafe_allow_html=True)
 st.sidebar.markdown("---")
 
+# Default model/meta locations in same folder as app.py
+DEFAULT_MODEL = os.path.join(BASE_DIR, "wheat_resnet50.keras")
+DEFAULT_META = os.path.join(BASE_DIR, "wheat_metadata.json")
+
 with st.sidebar.expander("Model settings", expanded=False):
-    model_path = st.text_input("Model file", value="wheat_resnet50.keras")
-    meta_path = st.text_input("Metadata file", value="wheat_metadata.json")
+    model_path_in = st.text_input("Model file", value="wheat_resnet50.keras")
+    meta_path_in = st.text_input("Metadata file", value="wheat_metadata.json")
+
+# Resolve to absolute paths
+model_path = os.path.join(BASE_DIR, model_path_in) if not os.path.isabs(model_path_in) else model_path_in
+meta_path = os.path.join(BASE_DIR, meta_path_in) if not os.path.isabs(meta_path_in) else meta_path_in
 
 top_k = st.sidebar.slider("Top-K predictions", 2, 5, 3)
-
 enable_download = st.sidebar.checkbox("Enable report download", value=True)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown(
-    "<div class='small'>Note: This app keeps inputs in 0–255 and only resizes.</div> ",
+    "<div class='small'>Note: This app keeps inputs in 0–255 and only resizes (model contains preprocessing layers).</div>",
     unsafe_allow_html=True
 )
-
-# Defaults if expander not opened
-if "model_path" not in locals():
-    model_path = "wheat_resnet50.keras"
-if "meta_path" not in locals():
-    meta_path = "wheat_metadata.json"
 
 
 # ---------------------------------------
@@ -240,20 +260,24 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
+if not isinstance(class_names, list) or len(class_names) == 0:
+    st.error("Invalid metadata: 'class_names' missing or empty.")
+    st.stop()
+
 if len(class_names) != 8:
     st.warning(f"Metadata contains {len(class_names)} classes (expected 8). Verify `wheat_metadata.json`.")
 
 
 # ---------------------------------------
-# Hero header (no clipping)
+# Hero header
 # ---------------------------------------
 st.markdown(f"""
 <div class="hero">
   <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap;">
     <div style="min-width:320px;">
       <div class="badge2">Wheat Plant Disease Detection</div>
-      <h2> Fast diagnosis with ResNet50</h2>
-      <div class="small">Upload an image or take a photo. The model predicts the 8 classes and shows top-K confidence.</div>
+      <h2>Fast diagnosis with ResNet50</h2>
+      <div class="small">Upload an image or take a photo. The model predicts 8 classes and shows top-K confidence.</div>
     </div>
     <div style="text-align:right; min-width:220px;">
       <div class="small">Model input</div>
@@ -275,19 +299,23 @@ left, right = st.columns([1.05, 0.95], gap="large")
 with left:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### 1) Provide an image")
-    st.markdown('<div class="small">Choose an input method. For best results, focus on the diseased region with clear lighting.</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="small">Choose an input method. For best results, focus on the diseased region with clear lighting.</div>',
+        unsafe_allow_html=True
+    )
 
     tab_upload, tab_camera = st.tabs(["📁 Upload image", "📷 Take photo"])
 
     pil_img = None
+    uploaded_name = None
 
     with tab_upload:
         uploaded = st.file_uploader("Upload (JPG/PNG)", type=["jpg", "jpeg", "png"], accept_multiple_files=False)
         if uploaded is not None:
             pil_img = Image.open(uploaded)
+            uploaded_name = getattr(uploaded, "name", "uploaded_image")
 
     with tab_camera:
-        # IMPORTANT: Do NOT mount camera_input automatically.
         if "camera_enabled" not in st.session_state:
             st.session_state.camera_enabled = False
 
@@ -300,6 +328,7 @@ with left:
             cam = st.camera_input("Take a photo", key="camera_widget")
             if cam is not None:
                 pil_img = Image.open(cam)
+                uploaded_name = "camera_photo"
 
             if button_stretch("Close camera", key="close_camera_btn"):
                 st.session_state.camera_enabled = False
@@ -335,7 +364,7 @@ with right:
         st.info("Provide an image from the left panel to see predictions.")
         st.markdown("</div>", unsafe_allow_html=True)
     else:
-        st.image(pil_img, caption=f"Preview (resized to {image_size}×{image_size} for inference)", use_container_width=True)
+        st_image_auto(pil_img, caption=f"Preview (resized to {image_size}×{image_size} for inference)")
 
         if run:
             with st.spinner("Running inference..."):
@@ -348,7 +377,7 @@ with right:
             st.markdown(f'<div class="kpi_sub">Confidence: {pred_prob*100:.2f}%</div>', unsafe_allow_html=True)
             st.progress(float(np.clip(pred_prob, 0.0, 1.0)))
 
-            # ✅ FIXED: bar chart using a DataFrame with column names
+            # Bar chart (Streamlit native)
             st.markdown("#### Top-K probabilities")
             df_bar = pd.DataFrame({
                 "Class": [c for c, _ in top],
@@ -357,7 +386,7 @@ with right:
 
             st.bar_chart(df_bar, x="Class", y="Probability (%)", height=220)
 
-            # Exact table
+            # Table (descending)
             df_table = df_bar.sort_values("Probability (%)", ascending=False).reset_index(drop=True)
             st.dataframe(df_table, use_container_width=True, hide_index=True)
 
